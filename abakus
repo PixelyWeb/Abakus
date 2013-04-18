@@ -1,0 +1,776 @@
+#!/usr/bin/perl -w
+# Abakus 1.0.8
+#
+# Abakus is a powerful tool which allows you to real-time analyse log files and extracting valuables information.
+# Copyright (C) 2012 Rachid El Youssfi (rachid@elyoussfi.com)
+#
+# This file is part of Abakus.
+#
+# Abakus is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Abakus is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Abakus.  If not, see <http://www.gnu.org/licenses/>.
+
+use strict;
+no warnings 'recursion';
+
+BEGIN{
+	use POSIX;
+    my $basedir = getcwd;
+    $ENV{'BASEDIR'} = $basedir;
+    push @INC, $basedir;
+    $ENV{'PERLLIB'} = $basedir;
+}
+
+use IO::File;
+use IO::Handle;
+use Getopt::Long;
+Getopt::Long::Configure ('bundling');
+use Sys::Syslog;
+use Date::Parse;
+use Time::HiRes qw/ tv_interval gettimeofday usleep/;
+use Time::Local;
+if ($^O	eq "linux"){
+	use Curses;
+}
+use threads;
+use threads::shared;
+use Thread::Queue;
+use Hook qw(:DEFAULT $data_queue);
+
+my $start_s = Time::HiRes::time();
+my $appname = "Abakus";
+my $version = "1.0.8";
+my $myname = $0;
+my (
+$usage, $total_duration, $nb_block, 
+$nb_recurse, $flip, $prev_w,
+$filter, $debug
+) 
+= 
+(
+0, 0, 0, 
+0, 0, 0,
+0, 0
+);
+*bspos = \&bs_pos;
+*pdate = \&parse_date;
+my $tfile		= "file.log";
+my $capture		= 0;
+my $hook		= '';
+my $start = time; 
+my $reference_date = 0;
+my $bsize = 64*1024;
+my $time_interval = 86400; # 24H
+my $block = "";
+my $reg_prefix = '^\s*(\d{1,4})\W*0{0,1}(\d{1,2})\W*0{0,1}(\d{1,2})\s*\W*0{0,1}(\d{0,2})\W*0{0,1}(\d{0,2})\W*0{0,1}(\d{0,2})';
+my $filters_file = 0;
+my $syslog = 'false';
+my $syslog_app_id = 'logparse';
+my($syslog_level, $syslog_facility) = ('info', 'local7'); 
+my $event_mode = 0;
+my $output = "";
+my $filter_fields = "sum|min|avg|max|diff|diff_sum|value|nb|occurence_sum";
+my %filter_fields_map = ("name"=>'mapper', "pattern"=>'', "nb"=>'0', "min"=>'0', "avg"=>'0', "max"=>'0', "sum"=>'0', "diff"=>'0', "value"=>'0');
+my $aggregate_line_split = '\s*|\s*';
+my $human_tt;
+my $fsize;
+my $selection_duration;
+my $analyze_duration;
+my $analyzed_files;
+my $analyzed_files_size; 
+my %placeholders = (
+"date_start" 		=> \$human_tt,
+"date_end"   		=> \$reference_date,
+"time_interval" 	=> \$time_interval,
+"app_id"			=> \$syslog_app_id,
+"total_duration"	=> \$total_duration,
+"analyze_duration"	=> \$analyze_duration,
+"selection_duration"	=> \$selection_duration,
+"analyzed_files"		=> \$analyzed_files,
+"analyzed_files_size"		=> \$analyzed_files_size,
+);
+my $date_format = "";
+my %date_formats = (
+"MM/DD/YY HH:MM:SS" 	=> '^\s*(\d{2,4})[\W|_]*(\d{1,2})[\W|_]*(\d{1,2})[\W|_]*(\d{0,2})[\W|_]*(\d{0,2})[\W|_]*(\d{0,2})',
+"MM-DD-YY HH:MM:SS" 	=> '^\s*(\d{2,4})[\W|_]*(\d{1,2})[\W|_]*(\d{1,2})[\W|_]*(\d{0,2})[\W|_]*(\d{0,2})[\W|_]*(\d{0,2})',
+"MM/DD/YY HH:MM:SS,ms"	=> '^\s*(\d{2,4})[\W|_]*(\d{1,2})[\W|_]*(\d{1,2})[\W|_]*(\d{0,2})[\W|_]*(\d{0,2})[\W|_]*(\d{0,2})[,]?(\d?)',
+"MM-DD-YY HH:MM:SS,ms" 	=> '^\s*(\d{2,4})[\W|_]*(\d{1,2})[\W|_]*(\d{1,2})[\W|_]*(\d{0,2})[\W|_]*(\d{0,2})[\W|_]*(\d{0,2})[,]?(\d?)',
+"%C" => '\s*\w+\s(\w+)\s(\d{1,2})\s(\d{1,2}):(\d{1,2})\s(\d{4})',
+"ctime" => '\s*\w+\s(\w+)\s(\d{1,2})\s(\d{1,2}):(\d{1,2}):(\d{1,2})\s(\d{4})',
+);
+
+
+my $win;
+my $accept_line = '';
+my $parser_mode = 'line';
+my $parser_splitter = '\n';
+my %filters = (); 
+$usage = 1 if @ARGV <= 0;
+
+GetOptions (
+'c=s' => \$capture,
+'d' => \$debug, 
+'f=s' => \$tfile,
+'h' => \$usage,
+'i=i' => \$time_interval,
+'r=s' => \$reference_date,
+'e=s'	=> \$filters_file,
+ );
+ 
+my $section = -1;
+my $output_mask;
+if ($filters_file){
+	open (FILTERS, "<", $filters_file) or die "Error: Can't open the filters file ($filters_file): $!.";
+	my $ofs = 0;
+	while (<FILTERS>) {
+		chomp;
+		next if /^#/;
+        if (/^\s*\[(\w+)\].*/) {
+			$section = 0 if $1 eq "filters";
+			$section = 1 if $1 eq "output";
+			$section = 2 if $1 eq "date_filter";
+			$section = 3 if $1 eq "input";
+			$section = 4 if $1 eq "performance";
+			$section = 5 if $1 eq "log";
+        }
+		if ( $section == 0 && /^accept_line=["|'](.*)["|'].*$/){
+			$accept_line = $1;
+		}
+		
+		if ( $section == 0 && /^parser_mode=["|'](.*)["|'].*$/){
+			$parser_mode = $1;
+		}		
+		
+		if ( $section == 0 && /^parser_splitter=["|'](.*)["|'].*$/){
+			$parser_splitter = $1;
+		}	
+		
+				
+        if ( $section == 0 && /^'([a-zA-Z0-9_.-]+)'\s*,\s*'(.*)'.*$/) {
+			$filter_fields_map{"name"} = $1;
+			$filter_fields_map{"pattern"} = $2;
+			$filters{$1} = {"pattern"=>$2, "nb"=>0, "occurence_sum" =>0, "min"=>0, "avg"=>0, "max"=>0, "sum"=>0, "diff"=>0, "diff_sum"=>0,"value"=>0};
+			$ofs++;
+        }
+		
+		if( $section == 1 && /^(.*).*$/){
+			next if /^\s*\[(\w+)\].*/;
+			$output_mask .= $1;
+		}
+		
+		if ( $section == 2 && /^date_filter="(.*)".*$/){
+			$date_format = $1;
+			if (not defined $date_formats{$1}){
+				$reg_prefix = $1;
+			}else{
+				$reg_prefix = $date_formats{$1};
+			}
+		}
+		
+		
+		if( $section == 3 && /^aggregate_line_split=["|'](.*)["|'].*$/){
+			$aggregate_line_split = $1;
+		}
+		
+		if( $section == 3 && /^event_mode=([0|1])$/){
+			$event_mode = $1;
+		}
+		
+		if( $section == 3 && /^file=["|'](.*)["|'].*$/){
+			if ($1 =~ m/\{(.*)\}/g){
+				$tfile = qx/$1/;
+				die "Error getting file path to parse: $tfile.\n" if not defined $1;				
+			}else{
+				$tfile = $1;
+			}
+			chomp($tfile);
+		}
+		if( $section == 3 && /^reference_date=["|'](.*)["|'].*$/){
+			if ($1 =~ m/\{(.*)\}/g){
+				$reference_date = qx/$1/;
+				die "Error getting the reference date: $reference_date.\n" if not defined $1;				
+			}else{
+				$reference_date = $1;
+			}
+			chomp($reference_date);
+		}
+		
+		if( $section == 3 && /^hook=["|'](.*)["|'].*$/){
+			$hook = $1;
+			chomp($hook);
+		}
+		
+		if( $section == 3 && /^time_interval=["|']*(.*)["|']*.*$/){
+			$time_interval = $1;
+			chomp($time_interval);
+		}
+		if( $section == 4 && /^search_block_size=["|']*(.*)["|']*.*$/){
+			$bsize = $1;
+			chomp($bsize);
+		}
+		if( $section == 5 && /^syslog=["|']*(.*)["|']*\s*$/){
+			$syslog = $1;
+			chomp($syslog);
+		}
+		if( $section == 5 && /^syslog_app_id=["|']*(.*)["|']*\s*/){
+			$syslog_app_id = $1;
+			chomp($syslog_app_id);
+		}
+		if( $section == 5 && /^syslog_level=["|']*(.*)["|']*\s*/){
+			$syslog_level = $1;
+			chomp($syslog_level);
+		}
+		if( $section == 5 && /^syslog_facility=["|']*(.*)["|']*\s*/){
+			$syslog_facility = $1;
+			chomp($syslog_facility);
+		}
+    }
+	close FILTERS; 
+}
+
+
+$syslog = ($syslog =~ m/true/)? 1:0;
+if($syslog){
+	openlog($syslog_app_id, 'cons,pid', 'user');
+}
+
+if ($usage){
+print <<EOF
+ 
+ >> $appname <<
+ Version : $version 
+ Usage   : $myname [-d] [-i <seconds>] [-f <file path>] [-r <date>]
+	Options: 
+		-c : capture the matched results and write it in a file.
+		-d : activate the debug mode
+		-f : the path of file to parse
+		-h : print this help menu
+		-i : the time interval to parse
+		-r : the reference date from where to parse. the date format should be YYYY MM DD HH mi s. 
+		-e : specify a filters file. The filters file permits you to defined your key filters, the output format 
+			 and also the date format to analyze.
+			 
+EOF
+;
+	exit;
+}
+my $nb_filters = keys %filters;
+
+if ($capture){
+	open (CAPTURE, ">", $capture) or die "Error: Can't open the capture file ($capture): $!.";
+}
+
+
+my $seek_end; 
+my $sregex = '\n';
+
+if( $parser_mode eq "date" and $parser_splitter eq "ctime"){
+	$sregex = $date_formats{$parser_splitter};
+	$sregex =~ s/\(|\)|[\^]//g;
+}
+
+# Event Mode
+if( $event_mode ){
+	$fsize = -s $tfile;
+	$analyzed_files_size .= " ".($fsize/1024)."Ko";
+	sysopen(APPLOG, $tfile, Fcntl::O_RDONLY | Fcntl::O_BINARY | Fcntl::O_APPEND) 
+	or die "Error : Can't open the dhcp log file ($tfile): $!";
+	seek(APPLOG, 0, SEEK_END);
+	my($t, $ta, $tb, $c);
+	$tb=0;
+	$c=0;
+	for(;;){		
+		while(<APPLOG>){
+			next if ($_ =~ m/$accept_line/g) eq '';
+			my $loop_time = Time::HiRes::time();
+			if(my($year, $month, $day, $hour, $minute, $second, $ms) = $_ =~ m/$reg_prefix/){
+				$hour = $hour ? $hour |= 0 : $hour;
+				$minute = $minute ? $minute |= 0 : $minute;
+				$second = $second ? $second |= 0 : 0;
+				$ms = $ms ? $ms |= 0 : 0;
+				$t = timelocal($second,$minute,$hour,$day,int($month-1),$year);
+				$t = $t + ($ms/1000);
+				$filter = 0;
+				aggregate(\%filters, $_, $reg_prefix);
+				
+				$ta = floor($t - $loop_time);
+				my $temp  =  floor($loop_time - $tb);
+				
+				if( (floor($t - $tb) >= 1 or floor($loop_time - $tb) >= 1)){
+					$output = compile_output(\%filters, $nb_filters, $output_mask,0);
+					print $output;
+					if($syslog){
+						syslog("$syslog_level|$syslog_facility", '%s', $output);
+					}
+				}
+				$tb = $loop_time;
+				$c=0;
+			}
+			sleep(1);
+		}
+		for ($fsize = -s APPLOG; $fsize == -s APPLOG; usleep 100000) { }
+		APPLOG->clearerr();
+	}
+	exit;
+}
+
+my ($pos, $tt);
+# OnDemand Mode
+my @files = split /\s|\n/, $tfile;
+foreach my $file (@files){
+	$analyzed_files .= " $file";
+	$fsize = -s $file;
+	$analyzed_files_size .= " ".sprintf("%.3f", $fsize/1024)."Ko";
+
+	sysopen(APPLOG, $file, Fcntl::O_RDONLY | Fcntl::O_BINARY | Fcntl::O_APPEND) 
+		or die "Error : Can't open the dhcp log file ($tfile): $!";
+if ( $reference_date ){
+	$start = pdate($reference_date);
+	if(!$start){
+		print "Error: Date format not supported.\n";
+		debug();
+		exit -1;
+	}
+	$seek_end = bspos(\*APPLOG, $start, 0, $fsize);
+	if($seek_end == -1){
+		print "The given time is out of bounds (not covered by the file $tfile).\n";
+		debug();
+		exit -1;
+	}
+	seek(APPLOG, $seek_end, 0);
+	my $li = <APPLOG>;
+	$seek_end += length ($li);
+}else{
+	$reference_date = localtime($start);
+	$seek_end = $fsize;
+}
+$tt = int($start - $time_interval);
+$human_tt = localtime($tt);
+my $pos = bspos(\*APPLOG, $tt, 0, $seek_end);
+
+if($seek_end < 0 && $pos == -1){
+	print "The given time is out of bounds (not covered by the file $tfile).\n";
+	debug();
+	exit -1;
+}
+
+# call the hook program 
+my $hook_thr;
+if(  $hook ne '' ){
+	if( $hook =~ m/\[(.*)\]/g ){
+		my @hargs = ($reg_prefix, split /,/, $1);
+		my $hai = 0;
+		foreach my $ha (@hargs){
+			$hargs[$hai] = *APPLOG if $ha =~ /fh/;
+			$hargs[$hai] = $pos if $ha =~ /s_start/;
+			$hargs[$hai] = $seek_end if $ha =~ /s_end/;
+			$hai++;
+		}
+		$hook =~ s/\[(.*)\]//g;
+		($hook_thr) = threads->create(\&$hook, @hargs);
+	}else{
+		($hook_thr) = threads->create(\&$hook, (\%filters, $reg_prefix));
+	}
+}
+	seek(APPLOG, $pos, 0);
+	my $data;
+	my $aggregation;
+	my $nb_bulks = 0;
+	my @positions = ();
+	my $t2 = Time::HiRes::time();
+	$selection_duration = $t2 - $start_s;
+
+	*ac = \&aggregate_compute; 
+	*mp = \&match_all_positions;
+
+	while (read(APPLOG,$block,$bsize)) {
+		$nb_block++;
+		$data .= $block;
+		if(tell(APPLOG) >= $seek_end){
+			$nb_bulks++;
+			if( $data ne "" and $data =~ m/$accept_line/g ){
+				print CAPTURE $data if $capture;
+				$data_queue->enqueue($data) if ($hook);
+				$aggregation = ac(\%filters, $data, $nb_bulks);
+			}
+			last;
+		}
+		
+		if( $data ne ""){
+			@positions = mp ($sregex, $data);
+			my $nbpos = scalar (@positions);
+			if( $nbpos >= 2 ){
+				$nb_bulks++;
+				my $bulked = '';
+				for(my $i =0; $i < ($nbpos -1) ; $i++){
+					#print " {{ i=$i nbpos=$nbpos -- offset ".$positions[$i][0]." with ".$positions[$i+1][0]." --}} \n";
+					my $o = $positions[$i][0]; 
+					my $l = $positions[$i+1][0] - $o; 
+					my $bulk = substr $data, $o, $l;
+					$bulked .= $bulk;
+					#print CAPTURE $bulk if $capture;
+					next if ($bulk =~ m/$accept_line/g) eq '';
+					#print "{{ after }} \n";
+					$data_queue->enqueue($bulk) if ($hook);
+					$aggregation = ac(\%filters, $bulk, $nb_bulks);	
+				}
+				$data = substr $data, $positions[$nbpos-1][0];
+			}
+		}
+		
+	}
+
+	$analyze_duration = Time::HiRes::time() - $t2;
+
+	if($hook and $hook_thr){
+		$data_queue->enqueue('quit');
+		my $th_results = $hook_thr->join();
+		%filters = %$th_results;
+		$nb_filters = keys %filters;
+	}
+
+	
+}
+$total_duration = sprintf("%.3f", Time::HiRes::time() - $start_s);
+print compile_output(\%filters, $nb_filters, $output_mask,0);
+
+if($syslog){
+	syslog("$syslog_level|$syslog_facility", '%s', $output);
+	closelog(); 
+}
+ 
+close APPLOG;
+close CAPTURE if $capture;
+debug();
+
+sub compile_output{
+	my ($my_filters, $nb_filters, $output_mask, $one_line) = @_;
+	#my @filters = @{$f};
+	
+	# output
+	$output = "";
+	#my %stat_types =  $filter_fields_map;
+	if ($filters_file && defined $output_mask){
+		$output_mask =~ s/^format="|"\s*$//g;
+		$output_mask =~ s/\\'/'/g;
+		$output_mask =~ s/\\n/\n/g;
+		$output_mask =~ s/\\t/\t/g;
+		$output_mask =~ s/\\r/\r/g;
+		$output_mask =~ s/format="//;
+		foreach my $key (keys %$my_filters){
+			
+			if( my @types = $output_mask =~ m/$key\[([$filter_fields]+)\]/g){
+				my $r = 'undefined';
+				foreach my $type (@types){
+					#print "[key=$key, type=$type]\n";
+					$r = $$my_filters{$key}{$type} if defined $$my_filters{$key}{$type};
+					$output_mask =~ s/$key\[$type\]/$r/g;
+				}
+			}
+			
+			if( my @types = $output_mask =~ m/\{([a-zA-Z_-]+)\}/g){
+				
+				foreach my $type (@types){
+					my $r = 'undefined';
+					$r = ${$placeholders{$type}} if defined $placeholders{$type};
+					$output_mask =~ s/\{$type\}/$r/g;
+				}
+			}
+			
+		}
+		$output_mask =~ s/^\s|\s$//g;
+		$output = $output_mask;
+	}else{
+		my @f = split /\|/, $filter_fields;
+		foreach my $key (keys %$my_filters){
+			foreach my $type (@f){
+				$output .= $key.'='.$filters{$key}{$type}.';';
+			}
+		}
+	}
+
+	if($one_line == 1){
+		if ($^O	eq "linux"){
+			if (not defined $win){
+				$win = new Curses;
+				initscr();
+			}
+			move(1, 0);
+			printw "Counters :\n";
+			printw qq($output);
+			refresh();
+		}
+		return "$output\n";
+	}else{
+		return "$output\n";
+	}
+}
+
+sub debug{
+	if($debug){
+		printf "\n
+		----------------- DEBUG ------------------
+		Mode  :	%s
+		Syslog:					  
+			- Enabled			 : %s
+			- App ID			 : %s
+			- Level				 : %s
+			- Facility			 : %s
+		File :
+			- File		 		 : %s
+			- File size	 		 : %s
+			- Block size			 : %.2fKo
+			- Nb Blocks			 : %d
+		Processing :
+			- BS filter			 : %s
+			- nb filters	 	 	 : %d
+		
+		Scripts stats :
+			- Seek start-end	 	 : %d - %d
+			- Start time			 : %d (%s)
+			- Targeted time			 : %d (%s)
+			- Time Interval		 	 :	%d
+			- Nb recursion		 	 :  	%d
+			- Total duration		 : %.3f
+			- Selection duration		 : %6.f
+			- Analyze duration		 : %.3f
+			\n",
+			($event_mode)?  'event_mode': 'ondemand_mode', $syslog, $syslog_app_id, $syslog_level, $syslog_facility, $tfile, $analyzed_files_size, ($bsize/1024), $nb_block,
+			$reg_prefix, $nb_filters, $pos, $seek_end,
+			$start, $reference_date, $tt, $human_tt, $time_interval, $nb_recurse, $total_duration, $selection_duration, $analyze_duration
+			;
+
+		if ($^O	eq "linux"){
+			open( STAT , "</proc/$$/stat" )
+			or die "Unable to open stat file";
+			my @stat = split /\s+/ , <STAT>;
+			printf "	Processus stats :
+			- Virtual Memory 			: %.2fKo
+			- Resident set				: %.2fKo
+			- CPU Time [kernel code] 		: %.3f
+		------------------------------------------
+			\n", ($stat[22]/1024), ($stat[23]/1024), $stat[16];
+				
+			close( STAT );
+		}
+	}
+}
+
+sub bs_pos{
+	my ($file, $tt, $l, $h) = @_;
+	if( $h <= $l){
+		return 0;
+	}
+	my $m2 =0;
+	seek ($file, int(($l+$h)/2), 0) || die "Error: couldn't seek the file: $!.";
+	my $line = <$file>;
+	$m2 = tell($file);
+	while($line = <$file>){		
+		$m2 = tell($file) - length($line);
+		if((my $t = pdate($line)) > 0){
+			my $ds = -1;
+			if(($h-$l) <= 4096){
+				if($t > $tt) {
+					seek($file, $l, 0);					
+				}
+				my $sline = "";
+				while($sline = <$file>){
+					last if ($m2 > $h);
+					$m2 = tell($file) - length($sline);
+					if((my $t = pdate($sline)) > 0){			
+						if($t == $tt){
+							return $m2;
+						}						
+						if($t < $tt){
+							if ( $ds == 0){ 
+								return $m2;
+							}
+							$ds = 1;
+						}
+						if( $t > $tt){
+							if($ds > 0){
+								return $m2;
+							}
+							$ds = 0;
+						}
+					}
+				}
+				return $m2;
+			}elsif($t < $tt){
+				$l = $m2;
+				if( $prev_w == 2){
+					$flip++;
+				}
+				$prev_w = 1;
+				$nb_recurse++;
+				return bspos($file, $tt, $l, $h);
+			}elsif($t > $tt){
+				$h = $m2;
+				if ( !$flip && $l == 0 && $h <= $l){
+					return 0;
+				}
+				if( $prev_w == 1){
+						$flip++;
+				}
+				$prev_w = 2;
+				$nb_recurse++;
+				return bspos($file, $tt, $l, $h);
+			}
+			return $m2;
+		}
+	}
+	return 0;
+};
+
+sub aggregate_compute{
+	my ($my_filters, $l, $nb_line) = @_;
+	
+	foreach my $key ( keys %$my_filters){
+		my $f = $$my_filters{$key}{'pattern'}; 
+		next if !defined $f;
+		my $bt1 = Time::HiRes::time();	
+		my @occurences = $l =~ m/$f/g;
+		
+			my $bt2 = Time::HiRes::time() - $bt1;
+			#print "\n MP duration:  $bt2";
+		my $nbo = scalar (@occurences);
+		next if  $nbo <= 0;
+		my $k = $occurences[0];
+				
+		# nb
+		$$my_filters{$key}{"nb"} = $nbo;
+
+		# occurence sum 
+		$$my_filters{$key}{"occurence_sum"} += $nbo;
+				
+		# sum 
+		$$my_filters{$key}{"sum"} = mathop($$my_filters{$key}{"sum"}, $k, '+');
+				
+		# min
+		$$my_filters{$key}{"min"} =  
+		(mathop($$my_filters{$key}{"min"}, $k, '>') or ($nb_line == 1))?
+		$k 
+		: $$my_filters{$key}{"min"};
+					
+		# avg
+		$$my_filters{$key}{"avg"} = 
+		sprintf("%.2f", $$my_filters{$key}{"avg"}/$nb_line);
+					
+		#max					
+		$$my_filters{$key}{"max"} =
+		(mathop($$my_filters{$key}{"max"}, $k, '<'))? 
+		$k
+		: $$my_filters{$key}{"max"};
+				
+		# diff_sum
+		my $diff = 'null';
+		$diff = mathop($k, $$my_filters{$key}{"value"}, '-');
+		$$my_filters{$key}{"diff_sum"} = mathop($$my_filters{$key}{"diff"}, $diff, '+');
+		# diff
+		$$my_filters{$key}{"diff"} =  ($$my_filters{$key}{"occurence_sum"} == 0) ? 0:$diff;
+		# value
+		$$my_filters{$key}{"value"} = $k;
+	}
+	return $my_filters;
+}
+
+sub aggregate{
+	my ($my_filters, $data, $reg_prefix) = @_;
+	my ($output);
+	my $regex = $reg_prefix;
+	my $sregex = '\n';
+	if( $parser_mode eq "date" and $parser_splitter eq "ctime"){
+		$sregex = $date_formats{$parser_splitter};
+		$sregex =~ s/\(|\)|[\^]//g;
+	}
+	
+	my @bulks = $data =~ /($sregex)\s+(?:(?!$sregex))*/sx;
+	my $ms = 0;
+	my $nb_line = 1;
+	foreach my $l (@bulks){
+		#if(my $t = parse_date($l)){
+			#$t = $t + ($ms/1000);
+			$my_filters = aggregate_compute($my_filters, $l, $nb_line);
+			$nb_line++;
+		#}
+	}
+	return $my_filters;
+}
+
+sub match_all_positions {
+    my ($regex, $string) = @_;
+    my @ret;
+    while ($string =~ /$regex/g) {
+        push @ret, [ $-[0], $+[0] ];
+    }
+    return @ret
+}
+
+sub mathop{
+	my ($a, $b, $op) = @_;
+	return 'null' if ( $a =~ m/\w+/  or $b =~ m/\w+/); 
+	if( $a =~ m/[\W|_]+/
+	and
+	my($year, $month, $day, $hour, $minute, $second, $ms) = $a =~ m/$reg_prefix/g
+	) { 
+		$hour = $hour ? $hour |= 0 : $hour;
+		$minute = $minute ? $minute |= 0 : $minute;
+		$second = $second ? $second |= 0 : 0;
+		$ms = $ms ? $ms |= 0 : 0;			
+		my $t2 = timelocal($second,$minute,$hour,$day,int($month-1),$year);
+		$a = $t2 + ($ms/1000);
+	}
+	
+	if($b =~ m/[\W|_]+/
+	and
+	my ($year, $month, $day, $hour, $minute, $second, $ms) = $b =~ m/$reg_prefix/g
+	) { 
+		$hour = $hour ? $hour |= 0 : $hour;
+		$minute = $minute ? $minute |= 0 : $minute;
+		$second = $second ? $second |= 0 : 0;
+		$ms = $ms ? $ms |= 0 : 0;			
+		my $t2 = timelocal($second,$minute,$hour,$day,int($month-1),$year);
+		$b = $t2 + ($ms/1000);
+	}
+	
+	return ($a-$b) if $op eq '-';
+	return ($a+$b) if $op eq '+';
+	return ($a*$b) if $op eq '*';
+	return ($a/$b) if $op eq '/';
+	return ($a>$b)? 1:0 if $op eq '>';
+	return ($a>=$b)? 1:0 if $op eq '>=';
+	return ($a<$b)? 1:0 if $op eq '<';
+	return ($a>=$b)? 1:0 if $op eq '>=';
+}
+
+sub parse_date {
+	my($s) = @_;
+	my($year, $month, $day, $hour, $minute, $second);
+	if($date_format eq "%C"){
+		if( $s =~ /$sregex/){
+			return str2time($s);
+		}else{
+			return 0;
+		}		
+	}elsif($s =~ m/$reg_prefix/) {  
+		$year = $1;  $month = $2;   $day = $3;
+		$hour = $4;  $minute = $5;  $second = $6;
+		$hour 	= ($hour ne "") 	? $hour 	|= 0 : 0;
+		$minute = ($minute ne "") 	? $minute 	|= 0 : 0;
+		$second = ($second ne "") 	? $second 	|= 0 : 0;
+		$year = ($year < 100 ? ($year < 70 ? 2000+$year : 1900+$year) : $year);
+		return 0 if ($month > 12 or $day > 31 or $minute > 60 or $second  > 60);
+		
+		return timelocal($second,$minute,$hour,$day,$month-1,$year);
+  }
+  return  0;
+}
