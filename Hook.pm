@@ -2,7 +2,7 @@
 # Abakus 1.0.8
 #
 # Abakus is a powerful tool which allows you to real-time analyse log files and extracting valuables information.
-# Copyright (C) 2012 Rachid El Youssfi (rachid@elyoussfi.com)
+# Copyright (C) 2012 Rachid El Youssfi <rachid@elyoussfi.com>
 #
 # This file is part of Abakus.
 #
